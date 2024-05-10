@@ -2,25 +2,29 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
-	target string // 目标域名
-	port   int    // 代理端口
-	// httpProxy = "http://127.0.0.1:10809" // 本地代理地址和端口
+	target = "https://api.sensenova.cn" // 目标域名
+	port   int                          // 代理端口
 )
+
+var pathMap = map[string]string{
+	"/v1/api/chat/completions": "/v1/llm/chat-completions",
+	"/v1/api/models":           "/v1/llm/models",
+}
 
 func main() {
 	// 从命令行参数获取配置文件路径
-	flag.StringVar(&target, "domain", "https://api.openai.com", "The target domain to proxy.")
 	flag.IntVar(&port, "port", 9000, "The proxy port.")
 	flag.Parse()
 
@@ -29,7 +33,32 @@ func main() {
 	log.Println("Proxy port: ", port)
 
 	http.HandleFunc("/", handleRequest)
-	http.ListenAndServe(":"+strconv.Itoa(port), nil)
+	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func isAuthHeaderAkSk(value string) bool {
+	if !strings.HasPrefix(value, "Bearer ") {
+		return false
+	}
+	major := value[7:]
+	if !strings.Contains(major, "|") {
+		return false
+	}
+	akSk := strings.Split(major, "|")
+	return len(akSk) == 2
+}
+
+func genJWT(ak, sk string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": ak,
+		"exp": time.Now().Add(time.Second * 120).Unix(),
+		"nbf": time.Now().Add(-time.Second * 5).Unix(),
+	})
+
+	return token.SignedString([]byte(sk))
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -42,8 +71,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 去掉环境前缀（针对腾讯云，如果包含的话，目前我只用到了test和release）
-	newPath := strings.Replace(r.URL.Path, "/release", "", 1)
-	newPath = strings.Replace(newPath, "/test", "", 1)
+	log.Println("origin path", r.URL.Path)
+	newPath := r.URL.Path
+	_, ok := pathMap[newPath]
+	if ok {
+		newPath = pathMap[newPath]
+	}
 
 	// 拼接目标URL（带上查询字符串，如果有的话）
 	// 如果请求中包含 X-Target-Host 头，则使用该头作为目标域名
@@ -58,12 +91,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
-	// 本地打印代理请求完整URL用于调试
-	if os.Getenv("ENV") == "local" {
-		fmt.Printf("Proxying request to: %s\n", targetURL)
-	}
-
 	// 创建代理HTTP请求
+	log.Println("Proxying request to: ", targetURL)
 	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
 		log.Println("Error creating proxy request: ", err.Error())
@@ -74,6 +103,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// 将原始请求头复制到新请求中
 	for headerKey, headerValues := range r.Header {
 		for _, headerValue := range headerValues {
+			if headerKey == "Authorization" && isAuthHeaderAkSk(headerValue) {
+				akSk := strings.Split(headerValue[7:], "|")
+				headerValue, err = genJWT(akSk[0], akSk[1])
+				if err != nil {
+					log.Println("Error generating JWT: ", err.Error())
+					http.Error(w, "Error generating JWT", http.StatusInternalServerError)
+					return
+				}
+			}
 			proxyReq.Header.Add(headerKey, headerValue)
 		}
 	}

@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  openai-proxy:
+    container_name: sensenova-proxy-for-openai
+    image: sensenova-proxy-for-openai
+    restart: always
+    ports:
+    - '9000:9000'
+    command: ['./main']
